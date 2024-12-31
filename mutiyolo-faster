@@ -1,0 +1,99 @@
+import os
+import cv2
+import time
+import logging
+import uuid
+import numpy as np
+from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
+from ultralytics import YOLO
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 加载 YOLO 模型
+model = YOLO("best.engine")
+
+def process_image(image_path, save_dir="runs/exp"):
+    """
+    处理单张图像：推理、裁剪并保存结果（图像 + 标签）
+    """
+    try:
+        # 推理
+        results = model.predict(image_path, batch=1, save=False, conf=0.5, device='cuda', save_crop=False, half=True, save_txt=False, name='exp', exist_ok=True)
+
+        # 获取图像文件名（不含扩展名）
+        image_name = os.path.splitext(os.path.basename(image_path))[0]
+
+        # 遍历检测结果
+        for result in results:
+            if result.boxes is not None and len(result.boxes) > 0:
+                # 生成唯一 ID
+                unique_id = uuid.uuid4().hex[:8]
+
+                # 保存标签文件
+                label_filename = f"{image_name}_{unique_id}.txt"
+                label_path = os.path.join(save_dir, "labels", label_filename)
+                with open(label_path, "w") as f:
+                    for box in result.boxes:
+                        # 获取归一化后的坐标
+                        x_center, y_center, width, height = box.xywhn[0].tolist()
+                        class_id = int(box.cls)
+                        # 写入标签文件
+                        f.write(f"{class_id} {x_center} {y_center} {width} {height}\n")
+
+                # 保存裁剪图像
+                for box in result.boxes:
+                    # 获取类别名称
+                    class_name = model.names[int(box.cls)]
+                    class_dir = os.path.join(save_dir, "crops", class_name)
+                    os.makedirs(class_dir, exist_ok=True)
+
+                    # 裁剪图像
+                    crop = result.orig_img[int(box.xyxy[0][1]):int(box.xyxy[0][3]),
+                           int(box.xyxy[0][0]):int(box.xyxy[0][2])]
+
+                    # 生成裁剪图像文件名
+                    crop_filename = f"{image_name}_{unique_id}.jpg"
+                    cv2.imwrite(os.path.join(class_dir, crop_filename), crop)
+
+        logging.info(f"处理完成: {image_path}")
+    except Exception as e:
+        logging.error(f"处理失败: {image_path}, 错误: {e}")
+
+def process_images_in_process(image_paths):
+    """
+    在每个进程中处理分配到的图像列表
+    """
+    with ThreadPoolExecutor() as executor:
+        executor.map(process_image, image_paths)
+
+def distribute_images_to_processes(folder_path, num_processes):
+    """
+    读取文件夹下所有图像文件，并分配给指定数量的进程
+    """
+    image_extensions = (".jpg", ".png", ".jpeg", ".bmp")
+    image_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith(image_extensions)]
+    all_image_paths = np.array_split(image_files, num_processes)
+    with Pool(num_processes) as pool:
+        pool.map(process_images_in_process, all_image_paths)
+
+if __name__ == "__main__":
+    folder_path = ""#数据集位置
+    num_processes = 12  # 根据 CPU 核心数调整进程数量
+
+    # 创建保存结果的目录
+    save_dir = ""#保存位置
+    if os.path.exists(save_dir):
+        last_modified_time = time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime(os.path.getmtime(save_dir)))
+        new_save_dir = f"{save_dir}_backup_{last_modified_time}"
+        os.rename(save_dir, new_save_dir)  # 快速重命名旧目录
+        logging.info(f"目录已重命名: {save_dir} -> {new_save_dir}")
+    os.makedirs(os.path.join(save_dir, "crops"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "labels"), exist_ok=True)
+
+    # 处理图像
+    start_time = time.time()
+    distribute_images_to_processes(folder_path, num_processes)
+    end_time = time.time()
+    logging.info(f"总耗时: {end_time - start_time:.2f} 秒")
